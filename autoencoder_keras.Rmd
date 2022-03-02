@@ -1,0 +1,105 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(dslabs)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(keras)
+library(tensorflow)
+library(data.table)
+
+devtools::install_github("rstudio/reticulate", force = TRUE)
+```
+
+```{r}
+dat <- readRDS(file = "/Users/sebastiantsai/Desktop/Applied Math Thesis/comscore-activity-scaled.rds")
+dim(dat) #3999, 169
+set.seed(1)
+ind.train <- sample(1:nrow(dat),round(.8*nrow(dat)),replace = FALSE) #indices of which to take
+train <- data.matrix(dat[ind.train,])
+#train %>% arrange(train[,1])
+
+test <- data.matrix(dat[-ind.train,])
+#test %>% arrange(test[,1])
+
+dim(train) #3199, 169
+dim(test) #800, 169
+
+input_size = 24 * 7
+latent_size = 10
+
+#no need to reshape
+#reshape
+#x_train = array_reshape(features.train, dim=c(dim(features.train)[1], input_size)) #3199 * 169
+#x_test = array_reshape(features.test, dim=c(dim(features.test)[1], input_size)) #800 * 169
+
+```
+
+```{r}
+#defining the encoder
+enc_input = layer_input(shape = input_size) #start from the input layer
+enc_output = enc_input %>% 
+  layer_dense(units=54, activation = "relu") %>%  
+  layer_activation_leaky_relu() %>% 
+  layer_dense(units=latent_size) %>% 
+  layer_activation_leaky_relu()
+
+encoder = keras_model(enc_input, enc_output)
+summary(encoder) 
+
+
+```
+
+```{r}
+#defining the decoder starting with the latent layer
+dec_input = layer_input(shape = latent_size)
+dec_output = dec_input %>% 
+  layer_dense(units=54, activation = "relu") %>% 
+  layer_activation_leaky_relu() %>% 
+  layer_dense(units = input_size, activation = "sigmoid") %>% 
+  layer_activation_leaky_relu()
+
+decoder = keras_model(dec_input, dec_output)
+summary(decoder) 
+```
+
+```{r}
+#defining the autoencoder that starts with 168 and goes through encoder and decoder
+aen_input = layer_input(shape = input_size)
+aen_output = aen_input %>% 
+  encoder() %>% 
+  decoder()
+   
+aen = keras_model(aen_input, aen_output)
+summary(aen) #168 shrinks to 10 and returns to 168 again
+```
+
+```{r}
+#gradient based optimization, binary for use of sigmoid earlier
+aen %>% compile(optimizer="rmsprop", loss="binary_crossentropy", metrics='accuracy')
+#training the model
+#20 epochs where we see loss plateau
+xtrain <- train[,2:169]
+
+aen %>% fit(xtrain, xtrain, epochs=20, batch_size=54)
+```
+
+```{r}
+#generate x test data 
+encoded_imgs = encoder %>% predict(x_test)
+decoded_imgs = decoder %>% predict(encoded_imgs)
+#changing the shape of the decoded data
+pred_images = array_reshape(decoded_imgs, dim=c(dim(decoded_imgs)[1], 28, 28)) 
+#plot results
+n = 10
+op = par(mfrow=c(12,2), mar=c(1,0,0,0))
+for (i in 1:n) 
+{
+  plot(as.raster(pred_images[i,,]))
+  plot(as.raster(xtest[i,,]))
+}
+```
