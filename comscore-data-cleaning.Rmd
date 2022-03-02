@@ -1,0 +1,286 @@
+---
+title: "Comscore Data Cleaning"
+author: "Megan McQueen"
+date: "1/14/2022"
+output: html_document
+---
+
+Packages: 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# data cleaning
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+# for heatmaps
+library(ComplexHeatmap)
+library(pheatmap)
+library(RColorBrewer)
+# cluster analysis and autoencoding
+library(h2o)
+library(cluster)
+library(factoextra)
+# date/time processing
+library(lubridate)
+library(hms)
+```
+
+## Read in data
+
+Save as RDS file for faster access later.
+```{r}
+df0 <- read.csv("/Users/sebastiantsai/Desktop/Applied Math Thesis/raw data/browsing_sample_2017.csv")
+saveRDS(df0, file = "/Users/sebastiantsai/Desktop/Applied Math Thesis/raw data/browsing_sample_2017.rds")
+df0 <- readRDS(file = "/Users/sebastiantsai/Desktop/Applied Math Thesis/raw data/browsing_sample_2017.rds")
+
+```
+
+## Subset IDs
+
+Select subset of households from original dataset for test analysis.
+
+```{r}
+# how many houses originally?
+nhouseholds <- length(unique(df0$machine_id))
+print(paste(nhouseholds, "households total"))
+
+# sample n households
+n <- 300
+set.seed(1)
+samp_ids <- sample(unique(df0$machine_id),n)
+print(paste("sampling",n,"household(s)"))
+# include only above households in dataset
+df <- df0[df0$machine_id %in% samp_ids,]
+# new dataset length (rows)
+print(paste(nrow(df), "observations for",n,"household(s)"))
+# confirm no. households is correct
+#print(paste(length(unique(df$machine_id)) == n, "- no. households makes sense"))
+```
+
+## Date formatting
+
+### Function: Add date/time columns to dataframe
+```{r lubridate-try1}
+cleantimes <- function(df) {
+  # parse dates
+  df$event_date.ld <- ymd(df$event_date)
+  # weekday of session start
+  df$start_wday <- wday(df$event_date.ld, label = FALSE)
+  # parse times
+  df$event_time.ld <- hms::as_hms(df$event_time)
+
+  # length of session (period - minutes)
+  df$duration.ld <- minutes(df$duration)
+  # get date-time of session start
+  df$event_datetime <- ymd_hms(paste(as.character(df$event_date.ld), as.character(df$event_time.ld)))
+  # get session end date/time using duration and start date
+  df$event_end <- df$event_datetime + df$duration.ld
+  # weekday of session end
+  df$end_wday <- wday(df$event_end)
+  # start and end hours
+  df$start_hour <- hour(df$event_time.ld)
+  df$end_hour <- hour(df$event_end)
+  
+  return(df)
+}
+
+
+unique(df0.time$start_hour)
+temp <- df0.time %>% 
+  select(machine_id, event_date, event_time, duration)
+
+df0.time <- cleantimes(df0)
+#df0.time <- readRDS(file = "/Users/meganmcqueen/Box/Senior Project/data/browsing_sample_2017_cleanedTimes.rds")
+df0.time
+```
+
+Read in data after cleaning dates and times:
+
+```{r}
+df0.time <- readRDS(file = "/Users/meganmcqueen/Box/Senior Project/data/browsing_sample_2017_cleanedTimes.rds")
+paste0("Data from ",min(df0.time$event_datetime), " to ", max(df0.time$event_datetime))
+```
+
+Look at session lengths/hours on average:
+
+```{r time-graphs-1, message=F}
+# what proportion of sessions less than 1 hour?
+mean(df$duration < 60)
+# avg duration
+mean(df$duration)
+# plot durations
+df %>% ggplot(aes(duration)) + geom_histogram() + ggtitle("Session Durations in Minutes")
+```
+
+## Single matrix data structure
+
++ Number of columns = 168 (7*24) + 1 = 169 
++ Number of rows = number of households
+
+Let each day of the week (Sun - Sat) correspond with a value 1-7, $d$. 
+
++ Sun = 1
++ Mon = 2
++ Tues = 3
++ Wed = 4
++ Thurs = 5
++ Fri = 6
++ Sat = 7
+
+And let the hour of the day, from $0$ to $23$, be denoted by $h$. 
+
+In column 1 we have the data for hour 0 of day 1 (Sunday). 
+
+For a given day of week $d$, the columns corresponding to it are $(24d-23):24d$. 
+The column corresponding to hour $h$ on day $d$ is number $24d + h - 23$. 
+
+The last column, col $169$, contains the machine ID. 
+
+
+```{r redo-household-vector}
+# Function takes in a dataframe of internet use data
+# And outputs a vector with 24*7 entries containing activity stats
+household.vec <- function(df) {
+  # empty 7*24 VECTOR
+  m <- rep(0,24*7)
+  
+  # break up df into observations where session remained w/in same day
+  df.sameday <- df %>% filter(start_wday == end_wday)
+  # populate matrix for observations occurring within same day
+  for (i in 1:nrow(df.sameday)) {
+    day <- df.sameday$start_wday[i]
+    hour1 <- df.sameday$start_hour[i] 
+    hour2 <- df.sameday$end_hour[i]
+    # increment entry by 1 b/c observed activity during that hour/day of week
+    h1.index <- 24*day + hour1 - 23
+    h2.index <- 24*day + hour2 - 23
+    m[h1.index:h2.index] <- m[h1.index:h2.index] + 1
+  }
+
+  # Subset observations where session goes into next day
+  df.diffday <- df %>% filter(start_wday != end_wday)
+  # Only run the next part if there are multi-day cases
+  if ( nrow(df.diffday > 0) ) {
+      # populate matrix for obs occurring over span of multiple days
+    for (i in 1:nrow(df.diffday)) {
+      day1 <- df.diffday$start_wday[i]
+      day2 <- df.diffday$end_wday[i]
+      hour1 <- df.diffday$start_hour[i]
+      hour2 <- df.diffday$end_hour[i]
+      # get column numbers for filling in matrix
+      h1.index <- 24*day1 - 23 + hour1
+      h2.index <- 24*day2 - 23 + hour2
+      # first day - up to hour 24 of day1
+      m[h1.index:(24*day1)] <- m[h1.index:(24*day1)] + 1
+      # second day - begin at hour 1 of day2
+      m[(24*day2 - 23):h2.index] <- m[(24*day2 - 23):h2.index] + 1
+    }
+  }
+  return(m)
+}
+#household.vec(testdf)
+#unique(testdf$start_hour)
+```
+
+Now we can repeat this for every household to generate a matrix with 24*7 columns
+and n_households rows.
+
+```{r}
+get_matrix <- function(df) {
+  start_time <- Sys.time()
+  # strip unneeded columns from dataframe
+  machine_ids <- unique(df$machine_id) # the unique machine ids in this sample
+  n_machines <- length(unique(df$machine_id)) # num of unique machines/households
+  
+  # init n x (24*7 + 1) matrix to hold machine_id and
+  # activity stats for each day/hour combo
+  mat <- matrix(data = 0, nrow = n_machines, ncol = (24*7 + 1))
+  # iterate through all the machine_ids and add data to matrix
+  # one row per machine_id
+  for (i in 1:n_machines) {
+    id <- machine_ids[i]
+    mat[i,] <- c(household.vec(df[df$machine_id == id,]), id)
+    # notify user when halfway done
+    if (i == round(n_machines/2)) {
+      print("Halfway done...")
+    }
+  }
+  # print time taken to complete
+  end_time <- Sys.time()
+  print(end_time-start_time)
+  
+  # return populated 3D array with number of times active at each interval
+  return(mat)
+}
+```
+
+Test our matrix-generating code, then convert to dataframe and rename columns for interpretability.
+Columns will be named with the format `DayOfWeek.Hour`.
+
+```{r}
+matrix <- get_matrix(df0.time)# yay, it works
+#str(act0)
+format(object.size(matrix),units="KB")
+# create vector of column names denoting day of week + hour of day
+days.of.week <- c("Sun", "Mon", "Tue", "Wed", "Thur","Fri","Sat")
+hours.of.day <- as.character(paste0(seq(0,23)))
+# empty vector for column names
+col.names <- c()
+# create column names giving day of week and hour of day
+for (day in days.of.week) {
+  col.names <- append(col.names, paste0(day,".",hours.of.day))
+}
+# add last colname for machine_id
+new.names <- c(col.names,"machine_id")
+# now lets apply the better column names
+output.df <- data.frame(matrix)
+colnames(output.df) <- new.names
+```
+
+
+### Full data matrix generation
+
+```{r}
+# extract + format dates and times
+df0.cleantimes <- cleantimes(df0)
+# generate the matrix of hourly activity patterns
+m0 <- get_matrix(df0.cleantimes)
+
+# create vector of column names denoting day of week + hour of day
+days.of.week <- c("Sun", "Mon", "Tue", "Wed", "Thur","Fri","Sat")
+hours.of.day <- as.character(paste0(seq(0,23)))
+# empty vector for column names
+col.names <- c()
+# create column names giving day of week and hour of day
+for (day in days.of.week) {
+  col.names <- append(col.names, paste0(day,".",hours.of.day))
+}
+# add last colname for machine_id
+new.names <- c(col.names,"machine_id")
+# now lets apply the better column names
+output.df <- data.frame(m0)
+colnames(output.df) <- new.names
+```
+
+Save matrix as RDS file:
+
+```{r}
+saveRDS(output.df, file="/Users/sebastiantsai/Desktop/Applied Math Thesis/df0_sample_activity.rds")
+
+saveRDS(array, file="/Users/sebastiantsai/Desktop/Applied Math Thesis/df0_3d_array_unscaled.rds")
+##saveRDS(household_ids, file="/Users/sebastiantsai/Desktop/Applied Math Thesis/df0_3d_array_household_ids.rds")
+```
+
+First, prepare the dataset by standardizing the variables.
+
+Note: `scale is generic function whose default method centers and/or scales the columns of a numeric matrix.`
+
+### Save to RDS
+```{r}
+scaled.df <- data.frame(scale(output.df %>% select(!machine_id)))
+
+saveRDS(scaled.df, file="/Users/sebastiantsai/Desktop/Applied Math Thesis/df_sample_activity_scaled.rds")
+
+#readRDS("/Users/meganmcqueen/Box/Senior Project/data/df_sample_activity_scaled.rds")
+```
+
