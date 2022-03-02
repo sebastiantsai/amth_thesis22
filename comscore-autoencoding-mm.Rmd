@@ -1,0 +1,361 @@
+---
+title: "Internet Activity Data Autoencodinig"
+author: "Megan McQueen"
+date: "12/14/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dslabs)
+library(dplyr)
+library(ggplot2)
+library(h2o)
+library(tidyr)
+library(forcats)
+```
+
+# Initialize H2O session
+
+```{r}
+# use the below code to shut down and H20 instance and start over
+#h2o.shutdown()
+```
+
+```{r}
+h2o.no_progress()  # turn off progress bars
+h2o.init(max_mem_size = "5g")  
+
+```
+
+# Load data
+
+```{r}
+# activity data (unscaled)
+act0 <- readRDS(file="/Users/sebastiantsai/Desktop/Applied Math Thesis/df_sample_activity_scaled.rds")
+```
+
+Scale data and remove outlier machine_id:
+```{r}
+# filter out the outlier machine_id: 223284384
+# scale dataset and remove machine_id column
+#dat <- read.csv("/Users/sebastiantsai/Desktop/Applied Math Thesis/comscore-activity-scaled.csv")
+#saveRDS(dat, file = "/Users/sebastiantsai/Desktop/Applied Math Thesis/comscore-activity-scaled.rds")
+dat <- readRDS(file = "/Users/sebastiantsai/Desktop/Applied Math Thesis/comscore-activity-scaled.rds")
+
+#dat <- scale(act0 %>% filter(machine_id != 223284384) %>% select(!machine_id))
+
+```
+
+Separate into test and training sets:
+
+```{r init}
+# divide dataset into test (.2) and train (.8)
+set.seed(1)
+ind.train <- sample(1:nrow(dat),round(.8*nrow(dat)),replace = FALSE) #indices of which to take
+features.train <- dat[ind.train,] 
+features.test <- dat[-ind.train,]
+# create h2o object using training features
+features <- as.h2o(features.train)
+```
+
+# Train autoencoder
+
++ Activation functions: https://bradleyboehmke.github.io/HOML/deep-learning.html#activations
+
+
+> When the autoencoder uses only linear activation functions (reference Section 13.4.2.1) and the loss function is MSE, then it can be shown that the autoencoder reduces to PCA. When nonlinear activation functions are used, autoencoders provide nonlinear generalizations of PCA.
+
+## Single layer autoencoder
+
+```{r 2codings-train}
+# Train an autoencoder
+ae1 <- h2o.deeplearning(
+  x = seq_along(features),
+  training_frame = features,
+  autoencoder = TRUE,
+  hidden = 2, # 4 codings in the hidden layer
+  activation = 'Tanh',
+  sparse = TRUE
+)
+
+# Extract the deep features
+ae1_codings <- h2o.deepfeatures(ae1, features, layer = 1)
+ae1_codings.df <- as.data.frame(ae1_codings) # convert to dataframe
+
+# plot deep feature encodings
+ggplot(data = ae1_codings.df, aes(x = DF.L1.C1, y = DF.L1.C2)) +
+  geom_point(alpha=.3) + 
+  theme_minimal() + 
+  ggtitle("Autoencoder Projection Deep Features")
+```
+
+```{r codings-train}
+# Train an autoencoder
+ae2 <- h2o.deeplearning(
+  x = seq_along(features),
+  training_frame = features,
+  autoencoder = TRUE,
+  hidden = 100, # 4 codings in the hidden layer
+  activation = 'Tanh',
+  sparse = FALSE
+)
+
+# Extract the deep features
+#function to extract the nonlinear feature from an h2o dataset using an H2O deep learning model
+ae2_codings <- h2o.deepfeatures(ae2, features, layer = 1)
+ae2_codings.df <- as.data.frame(ae2_codings) # convert to dataframe
+
+# plot deep feature encodings
+ggplot(data = ae2_codings.df, aes(x = DF.L1.C1, y = DF.L1.C2)) +
+  geom_point(alpha=.3) + 
+  theme_minimal() + 
+  ggtitle("Autoencoder Projection Deep Features")
+```
+
+Visualize the single layer autoencoder:
+
+```{r}
+set.seed(1)
+# sample 4 test images
+index <- sample(1:nrow(features.test), 4)
+sample <- features.test[index, ]
+# use best model from earlier
+best_model <- h2o.getModel(ae1@model_id)
+#best_model_id <- ae_grid@model_ids[[1]]
+#best_model <- h2o.getModel(best_model_id)
+
+# reconstruct the images
+reconstructed <- predict(best_model, as.h2o(sample))
+names(reconstructed) <- names(features.test)
+
+combine <- rbind(sample, as.matrix(reconstructed))
+
+# Plot original versus reconstructed
+par(mfrow = c(1, 3), mar=c(1, 1, 1, 1))
+layout(matrix(seq_len(nrow(combine)), 4, 2, byrow = FALSE))
+for(i in seq_len(nrow(combine))) {
+  z = matrix(data = combine[i, ], nrow = 7, ncol = 24, byrow=TRUE)
+  z[1,1] = 0
+  mode(z) = "numeric"
+  image(z, xaxt="n", yaxt="n")
+ 
+  
+}
+
+```
+
+Visualize other one (non sparse):
+```{r}
+best_model <- h2o.getModel(ae2@model_id)
+#best_model_id <- ae_grid@model_ids[[1]]
+#best_model <- h2o.getModel(best_model_id)
+
+# reconstruct the images
+reconstructed <- predict(best_model, as.h2o(sample))
+names(reconstructed) <- names(features.test)
+
+combine <- rbind(sample, as.matrix(reconstructed))
+
+# Plot original versus reconstructed
+par(mfrow = c(1, 3), mar=c(1, 1, 1, 1))
+layout(matrix(seq_len(nrow(combine)), 4, 2, byrow = FALSE))
+for(i in seq_len(nrow(combine))) {
+  
+  z = matrix(data = combine[i, ], nrow = 7, ncol = 24, byrow=TRUE)
+  z[1,1] = 0
+  mode(z) = "numeric"
+  image(z, xaxt="n", yaxt="n")
+}
+
+```
+
+
+## Stacked autoencoder
+
+```{r}
+# Hyperparameter search grid
+hyper_grid <- list(hidden = list(
+  c(50),
+  c(100), 
+  c(300, 100, 300),
+  c(100, 50, 100)#,
+  #c(250, 100, 50, 100, 250)
+  ),
+  activation = list(
+    c("Tanh"), 
+    c("TanhWithDropout")#, 
+    #c("Rectifier"), 
+    #c("RectifierWithDropout"),
+    #c("Maxout")#, 
+    #c("MaxoutWithDropout")
+    )
+  )
+
+# Execute grid search
+ae_grid <- h2o.grid(
+  algorithm = 'deeplearning',
+  x = seq_along(features),
+  training_frame = features,
+  grid_id = 'autoencoder_grid',
+  autoencoder = TRUE,
+ # activation = 'Tanh',
+  hyper_params = hyper_grid,
+  sparse = TRUE,
+  ignore_const_cols = FALSE,
+  seed = 123
+)
+
+# Print grid details
+grid1 <- h2o.getGrid('autoencoder_grid', sort_by = 'mse', decreasing = FALSE)
+grid1
+```
+
+Try another grid search using single hidden layer and 'tanh' activation function:
+
+```{r}
+# Hyperparameter search grid
+hyper_grid <- list(hidden = list(
+  c(2),
+  c(5),
+  c(10),
+  c(20),
+  c(50),
+  c(80),
+  c(100),
+  c(150),
+  c(100, 50, 100),
+  c(20, 10, 20)),
+  activation = list(
+    c("Tanh"), 
+    c("TanhWithDropout"))
+  )
+
+# Execute grid search
+ae_grid <- h2o.grid(
+  algorithm = 'deeplearning',
+  x = seq_along(features),
+  training_frame = features,
+  grid_id = 'autoencoder_grid',
+  autoencoder = TRUE,
+  hyper_params = hyper_grid,
+  sparse = TRUE,
+  ignore_const_cols = FALSE,
+  seed = 123
+)
+
+# Print grid details
+grid <- h2o.getGrid('autoencoder_grid', sort_by = 'mse', decreasing = FALSE)
+grid
+
+grid.summary <- na.omit(data.frame(hidden = as.numeric(grid@summary_table$hidden),
+           activation = grid@summary_table$activation, 
+           mse = grid@summary_table$mse, 
+           model_ids = grid@summary_table$model_ids))
+grid.sum2 <- grid
+saveRDS(grid@summary_table, file="gridsummary2.rds")
+```
+
+
+
+## Visualize reconstructions
+
+Compare reconstructed versions with originals.
+
+```{r}
+set.seed(101)
+# sample 4 test images
+index <- sample(1:nrow(features.test), 4)
+sample <- features.test[index, ]
+# use best model from earlier
+#best_model <- h2o.getModel(ae1@model_id)
+best_model_id <- grid@model_ids[[2]]
+best_model <- h2o.getModel("autoencoder_grid_model_5")
+
+# reconstruct the images
+reconstructed <- predict(best_model, as.h2o(sample))
+#names(reconstructed) <- names(features.test)
+
+combine <- rbind(sample, as.matrix(reconstructed))
+
+# Plot original versus reconstructed
+par(mfrow = c(1, 3), mar=c(1, 1, 1, 1))
+layout(matrix(seq_len(nrow(combine)), 4, 2, byrow = FALSE))
+for(i in seq_len(nrow(combine))) {
+  z = matrix(data = combine[i, ], nrow = 7, ncol = 24, byrow=TRUE)
+  z[1,1] = 0
+  mode(z) = "numeric"
+  image(z, xaxt="n", yaxt="n")
+}
+
+colnames(act0) %>% knitr::kable()
+saveRDS(act0, file="act0.rds")
+```
+
+## Sparse autoencoders
+
+
+```{r}
+ae100_codings <- h2o.deepfeatures(best_model, features, layer = 1)
+ae100_codings %>% 
+    as.data.frame() %>% 
+    tidyr::gather() %>%
+    summarize(average_activation = mean(value))
+
+
+          ae100_codings %>% 
+          as.data.frame() %>%
+          tidyr::gather() %>%
+          group_by(key) %>%
+          summarize(avg_act = mean(value)) %>%
+          mutate(pos = avg_act >= 0,
+                 key = fct_reorder(key, avg_act)) %>%
+          ggplot(aes(y = key, x = avg_act, color = pos)) +
+          geom_point(show.legend = FALSE) + 
+          theme_minimal() +
+          theme(axis.text.y = element_text(size = 5),
+                axis.title = element_text(size=10),
+                title = element_text(size=12),
+                ) +
+          labs(title = "Activation of coding neurons",
+               x = "Average activation",
+               y = "Deep feature codings"#,
+               #caption = "Activation of the coding neurons in our autoencoder using a Tanh activation function, with 1 hidden layer of 100 codings"
+               ) +
+          geom_vline(xintercept=0, 
+                     linetype = "dashed", 
+                     color = "black", 
+                     size = .5)
+```
+
+```{r plot-activation}
+plot_activation <- function(codings) {
+  
+          codings %>% 
+          as.data.frame() %>%
+          tidyr::gather() %>%
+          group_by(key) %>%
+          summarize(avg_act = mean(value)) %>%
+          mutate(pos = avg_act >= 0,
+                 key = fct_reorder(key, avg_act)) %>%
+          ggplot(aes(y = key, x = avg_act, color = pos)) +
+          geom_point(show.legend = FALSE) + 
+          theme_minimal() +
+          theme(axis.text.y = element_text(size = 5),
+                axis.title = element_text(size=10),
+                title = element_text(size=12),
+                ) +
+          labs(title = "Activation of coding neurons",
+               x = "Average activation",
+               y = "Deep feature codings"#,
+               #caption = "Activation of the coding neurons in our autoencoder using a Tanh activation function, with 1 hidden layer of 100 codings"
+               ) +
+          geom_vline(xintercept = 0, 
+                     linetype = "dashed", 
+                     color = "black", 
+                     size = .5)
+}
+
+```
+
+
